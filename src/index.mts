@@ -42,7 +42,7 @@ function logStage(message: string): void {
 
 type Phase1Key = string;
 type Phase1Map = Map<Phase1Key, string[]>;
-type FileHashMap = Map<string, string[]>; // (preKey + : + hash) → files
+type FileHashMap = Map<string, string[]>;
 
 function computePreliminaryKey(absPath: string, baseDir: string, size: number): string {
     if (matchPaths) {
@@ -55,34 +55,42 @@ function computePreliminaryKey(absPath: string, baseDir: string, size: number): 
     }
 }
 
+async function getAllFileSizes(files: string[]): Promise<Map<string, number>> {
+    const entries = await Promise.all(
+        files.map(async f => {
+            const size = (await fs.stat(f)).size;
+            return [f, size] as const;
+        })
+    );
+    return new Map(entries);
+}
+
+async function processFileForGrouping(file: string, dir: string, map: Phase1Map, label: string, processedCounter: { count: number }, total: number): Promise<void> {
+    const stat = await fs.stat(file);
+    const key = computePreliminaryKey(file, dir, stat.size);
+    const list = map.get(key);
+    if (list) {
+        list.push(file);
+    } else {
+        map.set(key, [file]);
+    }
+
+    if (verbose) {
+        processedCounter.count++;
+        if (processedCounter.count % 100 === 0 || processedCounter.count === total) {
+            console.error(`[${label}] ${processedCounter.count}/${total} grouped`);
+        }
+    }
+}
+
 async function getPreliminaryMap(dir: string, label: string): Promise<Phase1Map> {
     const files = await globby(["**/*"], { cwd: dir, absolute: true, onlyFiles: true });
     const map: Phase1Map = new Map();
-    let processed = 0;
+    const processed = { count: 0 };
 
     logStage(`Grouping files in ${label} by preliminary key (${files.length} files)`);
 
-    await Promise.all(
-        files.map(file =>
-            limit(async () => {
-                try {
-                    const stat = await fs.stat(file);
-                    const key = computePreliminaryKey(file, dir, stat.size);
-                    if (!map.has(key)) map.set(key, []);
-                    map.get(key)!.push(file);
-                } catch (err) {
-                    console.error(`Error stating file: ${file}`, err);
-                }
-
-                if (verbose) {
-                    processed++;
-                    if (processed % 100 === 0 || processed === files.length) {
-                        console.error(`[${label}] ${processed}/${files.length} grouped`);
-                    }
-                }
-            })
-        )
-    );
+    await Promise.all(files.map(file => limit(() => processFileForGrouping(file, dir, map, label, processed, files.length))));
 
     logStage(`Finished grouping ${label} (${map.size} key buckets)`);
     return map;
@@ -92,45 +100,86 @@ function hashToHex(hashBigInt: bigint): string {
     return hashBigInt.toString(16).padStart(16, "0");
 }
 
-async function hashGroup(files: string[], preKey: string, label: string, hasher: (data: Uint8Array) => bigint): Promise<FileHashMap> {
-    const map: FileHashMap = new Map();
-    let processed = 0;
+class GlobalHashingState {
+    processed = 0;
+    hashedBytes = 0;
+    dupes = 0;
+    totalJobFiles = 0;
+    totalBytes = 0;
 
-    await Promise.all(
-        files.map(file =>
-            limit(async () => {
-                try {
-                    const buf = await fs.readFile(file);
-                    const hash = hashToHex(hasher(buf));
-                    const key = `${preKey}:${hash}`;
-                    if (!map.has(key)) map.set(key, []);
-                    map.get(key)!.push(file);
-                } catch (err) {
-                    console.error(`Error hashing file: ${file}`, err);
-                }
+    constructor(totalJobFiles: number, totalBytes: number) {
+        this.totalJobFiles = totalJobFiles;
+        this.totalBytes = totalBytes;
+    }
 
-                if (verbose) {
-                    processed++;
-                    if (processed % 100 === 0 || processed === files.length) {
-                        console.error(`[${label}] ${processed}/${files.length} hashed`);
-                    }
-                }
-            })
-        )
-    );
+    logProgress(file: string): void {
+        if (!verbose) return;
+        const lines = [
+            `Hashed: ${file}`,
+            `Files: ${this.processed} of ${this.totalJobFiles}`,
+            `Bytes: ${this.hashedBytes} of ${this.totalBytes}`,
+            `Dupes: ${this.dupes} of ${this.totalJobFiles}`
+        ];
+        process.stderr.write("\x1b[4F" + lines.map(line => `\x1b[0K${line}`).join("\n") + "\n");
+    }
+}
 
-    return map;
+class HashingContext {
+    readonly hasher: (data: Uint8Array) => bigint;
+    readonly matchMap?: Set<string>;
+    readonly fileMap: FileHashMap = new Map();
+    readonly state: GlobalHashingState;
+
+    constructor(
+        hasher: (data: Uint8Array) => bigint,
+        state: GlobalHashingState,
+        matchMap?: Set<string>
+    ) {
+        this.hasher = hasher;
+        this.matchMap = matchMap;
+        this.state = state;
+    }
+
+    async processFile(file: string, preKey: string): Promise<void> {
+        if (verbose && this.state.processed === 0) {
+            this.state.logProgress(file);
+        }
+
+        const buf = await fs.readFile(file);
+        const hash = hashToHex(this.hasher(buf));
+        const key = `${preKey}:${hash}`;
+        const list = this.fileMap.get(key);
+        if (list) {
+            list.push(file);
+        } else {
+            this.fileMap.set(key, [file]);
+        }
+        this.state.hashedBytes += buf.length;
+        if (this.matchMap?.has(key)) this.state.dupes++;
+
+        this.state.processed++;
+        this.state.logProgress(file);
+    }
+}
+
+async function hashGroup(
+    files: string[],
+    preKey: string,
+    context: HashingContext
+): Promise<FileHashMap> {
+    await Promise.all(files.map(file => limit(() => context.processFile(file, preKey))));
+    return context.fileMap;
 }
 
 async function dedupe(oldDir: string, newDir: string): Promise<void> {
     logStage(`Using concurrency: ${concurrency}`);
-    if (dryRun) logStage(`Dry run enabled — no files will be deleted.`);
+    if (dryRun) logStage("Dry run enabled — no files will be deleted.");
 
     const hasher = await xxhash();
 
     const [oldGroups, newGroups] = await Promise.all([
         getPreliminaryMap(oldDir, "old directory"),
-        getPreliminaryMap(newDir, "new directory"),
+        getPreliminaryMap(newDir, "new directory")
     ]);
 
     const intersectingKeys = [...oldGroups.keys()].filter(key => newGroups.has(key));
@@ -138,60 +187,67 @@ async function dedupe(oldDir: string, newDir: string): Promise<void> {
 
     const oldHashMap: FileHashMap = new Map();
     const newHashMap: FileHashMap = new Map();
+    const allOldFiles = intersectingKeys.flatMap(k => oldGroups.get(k) ?? []);
+    const allNewFiles = intersectingKeys.flatMap(k => newGroups.get(k) ?? []);
+    const totalJobFiles = allOldFiles.length + allNewFiles.length;
+
+    const fileSizes = await getAllFileSizes([...allOldFiles, ...allNewFiles]);
+    const totalBytes = [...fileSizes.values()].reduce((a, b) => a + b, 0);
+
+    const globalState = new GlobalHashingState(totalJobFiles, totalBytes);
 
     for (const key of intersectingKeys) {
-        const oldGroup = oldGroups.get(key)!;
-        const newGroup = newGroups.get(key)!;
+        const oldGroup = oldGroups.get(key);
+        const newGroup = newGroups.get(key);
+        if (!oldGroup || !newGroup) continue;
 
-        const [oldHashes, newHashes] = await Promise.all([
-            hashGroup(oldGroup, key, `old:${key}`, data => hasher.h64Raw(data)),
-            hashGroup(newGroup, key, `new:${key}`, data => hasher.h64Raw(data)),
-        ]);
-
+        const oldCtx = new HashingContext(data => hasher.h64Raw(data), globalState);
+        const oldHashes = await hashGroup(oldGroup, key, oldCtx);
         for (const [hkey, paths] of oldHashes) {
-            if (!oldHashMap.has(hkey)) oldHashMap.set(hkey, []);
-            oldHashMap.get(hkey)!.push(...paths);
+            const list = oldHashMap.get(hkey);
+            if (list) list.push(...paths);
+            else oldHashMap.set(hkey, [...paths]);
         }
 
+        const knownHashes = new Set(oldHashMap.keys());
+        const newCtx = new HashingContext(data => hasher.h64Raw(data), globalState, knownHashes);
+        const newHashes = await hashGroup(newGroup, key, newCtx);
         for (const [hkey, paths] of newHashes) {
-            if (!newHashMap.has(hkey)) newHashMap.set(hkey, []);
-            newHashMap.get(hkey)!.push(...paths);
+            const list = newHashMap.get(hkey);
+            if (list) list.push(...paths);
+            else newHashMap.set(hkey, [...paths]);
         }
     }
 
     const duplicateKeys = [...oldHashMap.keys()].filter(k => newHashMap.has(k));
-    duplicateKeys.sort((a, b) => oldHashMap.get(a)![0].localeCompare(oldHashMap.get(b)![0]));
+    duplicateKeys.sort((a, b) => {
+        const aList = oldHashMap.get(a);
+        const bList = oldHashMap.get(b);
+        if (!aList || !bList) return 0;
+        return aList[0].localeCompare(bList[0]);
+    });
 
     for (const key of duplicateKeys) {
-        const oldFiles = oldHashMap.get(key)!;
-        const newFiles = newHashMap.get(key)!;
+        const oldFiles = oldHashMap.get(key);
+        const newFiles = newHashMap.get(key);
+        if (!oldFiles || !newFiles) continue;
 
         oldFiles.sort();
         newFiles.sort();
 
-        for (const file of oldFiles) {
-            console.log(file);
-        }
-        for (const file of newFiles) {
-            console.log("  " + file);
-        }
+        for (const file of oldFiles) console.log(file);
+        for (const file of newFiles) console.log("  " + file);
         console.log();
 
         for (const newFile of newFiles) {
             if (!dryRun) {
-                try {
-                    await fs.unlink(newFile);
-                    if (!verbose) console.log(`Deleted: ${newFile}`);
-                } catch (err) {
-                    console.error(`Error deleting ${newFile}:`, err);
-                }
+                await fs.unlink(newFile);
+                if (!verbose) console.log(`Deleted: ${newFile}`);
             }
         }
     }
 
-    if (!verbose) {
-        console.log("Done.");
-    }
+    if (!verbose) console.log("Done.");
 }
 
 await dedupe(path.resolve(oldDirInput), path.resolve(newDirInput)).catch(err => {
